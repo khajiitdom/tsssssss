@@ -1,0 +1,84 @@
+name: Build hdtSMP64 = Settle + GTSoftBody contact bridge (AVX2 + PDB)
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout this repo (bridge_core + patch)
+        uses: actions/checkout@v4
+
+      - name: Clone Settle-hdtSMP64 (FSMP 4.1.1 + Settle) pinned to ab97519
+        shell: bash
+        run: |
+          git clone https://github.com/Flob26/Settle-hdtSMP64.git hdtSMP64
+          cd hdtSMP64
+          git checkout ab9751927b91a845e858e1870dc75068a16f6ce5
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+
+      - name: Apply contact bridge patch
+        shell: bash
+        run: |
+          cd hdtSMP64
+          git apply --ignore-whitespace --whitespace=nowarn -p1 ../patch/FSMP_v4.1.1_contact_bridge.patch
+          git status --short
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-avx2-settle-${{ hashFiles('patch/**') }}
+          restore-keys: vcpkg-avx2-
+
+      - name: Configure (preset vs2022-windows-avx2)
+        shell: pwsh
+        working-directory: hdtSMP64
+        run: |
+          $cache = "$env:LOCALAPPDATA\vcpkg\archives"
+          New-Item -ItemType Directory -Force -Path $cache | Out-Null
+          $env:VCPKG_BINARY_SOURCES = "clear;files,$cache,readwrite"
+          New-Item -ItemType Directory -Force -Path "${{ github.workspace }}/out/plugins/SKSE/Plugins" | Out-Null
+          cmake --preset vs2022-windows-avx2 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_MANIFEST_MODE=ON `
+            -DCompiledPluginsPath="${{ github.workspace }}/out/plugins"
+
+      - name: Build
+        shell: pwsh
+        working-directory: hdtSMP64
+        run: cmake --build out/build/vs2022-windows-avx2 --config Release
+
+      - name: Collect DLL + PDB (must come from the same build)
+        shell: pwsh
+        run: |
+          $dist = "${{ github.workspace }}/dist/SKSE/Plugins"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          $dll = Get-ChildItem -Path "${{ github.workspace }}/hdtSMP64/out/build/vs2022-windows-avx2" -Recurse -Filter hdtsmp64.dll | Where-Object { $_.FullName -match 'Release' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $dll) { $dll = Get-ChildItem -Path "${{ github.workspace }}/out/plugins" -Recurse -Filter hdtsmp64.dll | Select-Object -First 1 }
+          if (-not $dll) { Write-Error "hdtSMP64.dll not found"; exit 1 }
+          $pdb = Join-Path $dll.DirectoryName "hdtsmp64.pdb"
+          if (-not (Test-Path $pdb)) {
+            $pdb = (Get-ChildItem -Path "${{ github.workspace }}" -Recurse -Filter hdtsmp64.pdb | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+          }
+          if (-not $pdb -or -not (Test-Path $pdb)) { Write-Error "hdtsmp64.pdb not found"; exit 1 }
+          Write-Host "DLL: $($dll.FullName)"
+          Write-Host "PDB: $pdb ($([math]::Round((Get-Item $pdb).Length/1MB,1)) MB)"
+          Copy-Item $dll.FullName "$dist/hdtSMP64.dll"
+          Copy-Item $pdb "$dist/hdtSMP64.pdb"
+          $pv = [System.Diagnostics.FileVersionInfo]::GetVersionInfo("$dist/hdtSMP64.dll").ProductVersion
+          Write-Host "ProductVersion: $pv"
+          if ($pv -notmatch "avx2") { Write-Error "Not an AVX2 build"; exit 1 }
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("$dist/hdtSMP64.dll"))
+          if (-not $text.Contains("GTFSMP_GetContactBridgeV1")) { Write-Error "Bridge export missing"; exit 1 }
+          if (-not $text.Contains("world-collision interface")) { Write-Error "Settle world-collision code missing"; exit 1 }
+          Write-Host "OK: AVX2 + GTSoftBody bridge + Settle world-collision + PDB"
+
+      - name: Upload result (DLL + PDB together)
+        uses: actions/upload-artifact@v4
+        with:
+          name: hdtSMP64-Settle-GTBridge-avx2-with-pdb
+          path: dist/
+          if-no-files-found: error
